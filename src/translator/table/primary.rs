@@ -782,6 +782,9 @@ impl PrimaryTable {
                         builder
                             .backward_caps_constrainer
                             .capsletter(&dots.to_string());
+                        builder
+                            .backward_nocontract_constrainer
+                            .caps_indicator(&dots.to_string());
                     }
                 }
                 Rule::Begcapsword { dots, .. } => {
@@ -799,6 +802,9 @@ impl PrimaryTable {
                         builder
                             .backward_caps_constrainer
                             .begcapsword(&dots.to_string());
+                        builder
+                            .backward_nocontract_constrainer
+                            .caps_indicator(&dots.to_string());
                     }
                 }
                 Rule::Endcapsword { dots, .. } => {
@@ -1896,6 +1902,31 @@ impl PrimaryTable {
                             .character_definitions()
                             .braille_to_unicode(dots, chars)?;
                         builder.backward_numeric_constrainer.rule_dots(&dots);
+                        // an `always` rule takes an indicator's dots as its own, where the
+                        // word-family rules would only be kept off the letters after it
+                        if matches!(rule.rule, Rule::Always { .. }) {
+                            builder.backward_nocontract_constrainer.rule_dots(&dots);
+                        }
+                        // and so does a rule inside a word after a letter, as UEB's ⠰⠎ for
+                        // "ness" does
+                        if matches!(
+                            rule.rule,
+                            Rule::Begmidword { .. }
+                                | Rule::Midword { .. }
+                                | Rule::Midendword { .. }
+                                | Rule::Endword { .. }
+                                | Rule::Partword { .. }
+                        ) {
+                            builder
+                                .backward_nocontract_constrainer
+                                .inword_rule_dots(&dots);
+                        }
+                    }
+                    // so does punctuation, as Danish `prepunc ! 56-235` does
+                    Rule::Prepunc { dots, .. } | Rule::Postpunc { dots, .. } => {
+                        builder
+                            .backward_nocontract_constrainer
+                            .rule_dots(&dots.to_string());
                     }
                     Rule::Context { test, .. } => {
                         if let Some(dots) = test.literal_text() {
@@ -1914,6 +1945,16 @@ impl PrimaryTable {
             builder
                 .backward_nocontract_constrainer
                 .letter_cells(letter_cells.clone());
+            // a character of several cells can start with an indicator's dots, as Danish
+            // "é" does with ⠰⠿, and takes them as its own
+            for dots in ctx.character_definitions().all_dots() {
+                builder.backward_nocontract_constrainer.rule_dots(dots);
+            }
+            builder.backward_nocontract_constrainer.space_cells(
+                ctx.dots_classes()
+                    .get(&CharacterClass::Space)
+                    .unwrap_or_default(),
+            );
             // A `digit` cell that is also a letter reads as the letter, which a table
             // defines first, so only a `litdigit` makes it a digit inside a number.
             let mut digit_cells: HashSet<char> = ctx
@@ -2189,6 +2230,14 @@ impl PrimaryTable {
             // cells that follow spell out letters, so the word-family rules must not
             // claim them. Only these four opcodes are suppressed -- liblouis leaves
             // `always`, `partword` and the mid-word opcodes eligible.
+            if self.direction == Direction::Backward && constraints.no_whole_word_at(char_pos) {
+                candidates.retain(|t| {
+                    !matches!(
+                        t.rule(),
+                        Some(Rule::Word { .. } | Rule::Sufword { .. } | Rule::Prfword { .. })
+                    )
+                });
+            }
             if self.direction == Direction::Backward && constraints.no_contract_at(char_pos) {
                 candidates.retain(|t| {
                     !matches!(
