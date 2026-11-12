@@ -50,6 +50,8 @@ pub enum CompileError {
     /// A rule refers to a swap class that no rule defines
     #[error("Swap class {0} not defined")]
     SwapClassNotDefined(String),
+    #[error("{0} is neither a class nor a swap")]
+    ClassNotDefined(String),
 }
 
 #[derive(Debug, Default, Clone)]
