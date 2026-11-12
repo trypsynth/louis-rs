@@ -174,6 +174,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - In back-translation, an emphasis indicator gives way to any other rule
   with the same dots: with `fr-bfu-comp6.utb`, ⠨⠨⠓⠉⠠⠄⠇ is "HCl", ⠠⠄
   ending the capitals rather than italics.
+- Back-translation now puts the space back between large signs written
+  together, as liblouis means to. With `en-us-g2.ctb`, ⠯⠮ gave "andthe"
+  instead of "and the".
 - A `match` rule whose `pre` starts inside the previous translation now
   applies, thanks to the look-behind above: with `en-ueb-g2.ctb`,
   "areas" gave ⠜⠑⠁⠎ instead of ⠜⠂⠎, as `always ar` covered the "r" that
