@@ -308,8 +308,8 @@ mod tests {
         // U.S. grade 2 writes "and the a" as ⠯⠮⠁, but the "the" and "a" of "theat" are part of a word
         let table = "space \\s 0\nlowercase a 1\nlowercase t 2345\nlargesign and 12346\nlargesign the 2346\nlargesign a 1\n";
         let translator = Translator::from_table_source(table, Direction::Backward).unwrap();
-        assert_eq!(translator.translate("⠯⠮⠁⠀⠯⠀⠮").unwrap(), "and the a and the");
-        assert_eq!(translator.translate("⠮⠁⠞").unwrap(), "theat");
+        assert_eq!(translator.translate("⠯⠮⠁⠀⠯⠀⠮"), "and the a and the");
+        assert_eq!(translator.translate("⠮⠁⠞"), "theat");
     }
 
     #[test]
