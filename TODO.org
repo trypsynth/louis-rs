@@ -159,15 +159,20 @@
     and ~rev()~ before ~max_by_key~) fixes these 5 and also th-g0's
     ~pass2 @⠣ ...~ against an included ~$a~ rule. It is parked in a
     stash, to be settled together with the primary-table ranking.
-- [ ] ~_N~ lookback in a pass test is ignored: ~context_pattern.rs~
-  compiles ~TestInstruction::Lookback~ to ~Regexp::Empty~. That is
-  fine for checks before the brackets, but a lookback that rewinds
-  past the start of the input should make the rule fail.
-  ~multipass-forward.yaml~'s "lookback count" test has
-  ~correct [$d5]_6 "f"~ and ~correct [$d5]_5 "s"~: on "12345" the
-  first must fail, louis-rs matches both. Since ~1ff7b7f~ the tie goes
-  to the first-defined rule, so ~multipass-forward.yaml~ and
-  ~multipass-backward.yaml~ lose that test.
+- [ ] ~_N~ only before or after the tests it steps over: the parser
+  turns a leading ~_N~ into a look-behind and a trailing one into a
+  look-ahead (~Test~'s ~lookbehind~, ~body~, ~lookahead~), and rejects
+  any other with ~MisplacedLookback~.
+  - Three inline tables in liblouis's own unit tests use other shapes
+    and no longer load, so 5 tests don't run: ~[$d5]_6~ and
+    ~[$d5]_5~ (step back into the bracket) in ~multipass-forward.yaml~
+    and ~multipass-backward.yaml~, and ~_["fu"]~ ("should fail if _
+    goes negative") in ~multipass.yaml~. Propose a liblouis PR that
+    tests the same with the two supported shapes, e.g. ~_$a["u"]~ at
+    the start of the input.
+  - The real tables' three middle ~_N~s are fixed upstream in
+    liblouis#2196 (~it-it-comp6.utb~) and #2197 (~th-g2.ctb~); until
+    they land, those two tables don't load.
 - [X] A ~match~ rule's ~pre~ is missed when the previous match consumed
   more than one character
   - ~match~ rules with a ~pre~ pattern are discovered at the position
@@ -443,3 +448,30 @@
   implemented — mode flags in ~TranslationOptions~ meant to expand the
   current word into computer braille without ~begcomp~/~endcomp~
   indicators
+
+* Test suite gaps
+Tests in liblouis's YAML files that louis-rs never runs, so they report
+neither pass nor fail. Moved here from ~doc/Liblouis_Parity.md~.
+- [ ] Forty blocks across twelve files are skipped because their table
+  won't load (reported on stderr):
+  - 25: ~multipass-vs-match_common.uti~ not found. The include sits
+    next to the YAML file rather than on ~LOUIS_TABLE_PATH~, which takes
+    out every block of ~multipass-vs-match.yaml~.
+  - 4: parser gaps. An ~EmptyTest~ in each of ~multipass-forward.yaml~
+    and ~multipass-backward.yaml~, an ~OpcodeExpected~ and a
+    surrogate-pair escape.
+  - 7: ambiguous metadata queries. ~language:grc region:en~ matches two
+    tables and ~system:cmn-traditional~ three; ~lou_findTable~ scores
+    its candidates and always lands on one, we intersect and insist on
+    exactly one.
+  - 2: hyphenation dictionaries. ~hyph_en_US.dic~ rejected for its
+    ISO-8859-1 encoding; ~hyphenation.dic~ not found.
+  - 1: ~macro.utb~ not found. Deliberate non-goal.
+  - 1: ~language:grc region:es~ finds no table. Possibly a bug in the
+    spec rather than in us.
+- [ ] The ~hyphenate~, ~hyphenateBraille~ and ~display~ test modes fall
+  through a catch-all arm in ~louis-cli/src/test.rs~ and report
+  nothing. ~de-eurobrl6.yaml~, ~hu-hu-g1-hyph_harness.yaml~ and
+  ~no_8dot_harness.yaml~ consist only of such tests; ~issue-332.yaml~
+  has its ~hyphenate~ block skipped while its other 19 tests all fail.
+  The hyphenate modes are wired up on branch ~hyphenate-testmode~.

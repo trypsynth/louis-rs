@@ -4,15 +4,16 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 /// Why an [`Index`] could not be built or a [`Query`] parsed.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
-pub enum MetaDataError {
+pub enum MetadataError {
     /// A directory on the search path could not be read
     #[error(transparent)]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
     /// A part of the query is not a `key:value` pair
     #[error("{0:?} is not a key:value pair")]
     InvalidQuery(String),
@@ -24,30 +25,34 @@ use search_path::SearchPath;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query(Vec<(String, String)>);
 
-impl Query {
+impl FromStr for Query {
+    type Err = MetadataError;
+
     /// Parse a query in liblouis's syntax, `key:value` pairs separated by whitespace, such
     /// as `language:de grade:2`.
-    pub fn parse(query: &str) -> Result<Self, MetaDataError> {
+    fn from_str(query: &str) -> Result<Self, MetadataError> {
         query
             .split_whitespace()
             .map(|pair| match pair.split_once(':') {
                 Some((k, v)) if !k.is_empty() && !v.is_empty() => {
                     Ok((k.to_string(), v.to_string()))
                 }
-                _ => Err(MetaDataError::InvalidQuery(pair.to_string())),
+                _ => Err(MetadataError::InvalidQuery(pair.to_string())),
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Self)
     }
+}
 
+impl Query {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
 
-impl From<&HashMap<String, String>> for Query {
-    fn from(query: &HashMap<String, String>) -> Self {
-        Self(query.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+impl FromIterator<(String, String)> for Query {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Self {
+        Self(pairs.into_iter().collect())
     }
 }
 
@@ -63,7 +68,7 @@ impl fmt::Display for Query {
 
 /// Maps each `#+key: value` metadata pair found on the search path to the tables
 /// that carry it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index(HashMap<(String, String), HashSet<PathBuf>>);
 
 impl Index {
@@ -73,7 +78,7 @@ impl Index {
     /// # Errors
     ///
     /// If a directory on the search path cannot be read.
-    pub fn new() -> Result<Self, MetaDataError> {
+    pub fn new() -> Result<Self, MetadataError> {
         Self::build(&SearchPath::new_or("LOUIS_TABLE_PATH", "."))
     }
 
@@ -82,7 +87,10 @@ impl Index {
     /// # Errors
     ///
     /// If a directory on the search path cannot be read.
-    pub fn with_search_path(search_path: Vec<PathBuf>) -> Result<Self, MetaDataError> {
+    pub fn with_search_path(
+        search_path: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> Result<Self, MetadataError> {
+        let search_path: Vec<PathBuf> = search_path.into_iter().map(Into::into).collect();
         Self::build(&SearchPath::from(search_path))
     }
 
@@ -90,15 +98,11 @@ impl Index {
     ///
     /// Today only a table carrying every one of the query's pairs matches, and the matches
     /// come sorted by path. liblouis also ranks partial matches; that is still to come.
-    pub fn find(&self, query: Query) -> Vec<&Path> {
+    pub fn find(&self, query: &Query) -> Vec<&Path> {
         if query.is_empty() {
             return Vec::new();
         }
-        let candidates: Vec<_> = query
-            .0
-            .into_iter()
-            .map(|(k, v)| self.0.get(&(k, v)))
-            .collect();
+        let candidates: Vec<_> = query.0.iter().map(|pair| self.0.get(pair)).collect();
         // if any of the queries was not found in the index then the whole query is empty
         if candidates.iter().any(|c| c.is_none()) {
             Vec::new()
@@ -117,7 +121,7 @@ impl Index {
 
     /// Derive the index by walking the whole of `search_path` and reading the
     /// metadata out of every table on it.
-    fn build(search_path: &SearchPath) -> Result<Self, MetaDataError> {
+    fn build(search_path: &SearchPath) -> Result<Self, MetadataError> {
         let mut index: HashMap<(String, String), HashSet<PathBuf>> = HashMap::new();
 
         for dir in search_path.iter() {
@@ -162,11 +166,11 @@ mod tests {
         fs::write(dir.join("a.utb"), "#+language: de\n#+grade: 2\n").unwrap();
         fs::write(dir.join("c.utb"), "#+language: de\n#+grade: 1\n").unwrap();
         let index = Index::with_search_path(vec![dir.clone()]).unwrap();
-        let found = index.find(Query::parse("language:de grade:2").unwrap());
+        let found = index.find(&"language:de grade:2".parse().unwrap());
         assert_eq!(found, [dir.join("a.utb"), dir.join("b.utb")]);
-        assert!(index.find(Query::parse("language:fr").unwrap()).is_empty());
-        assert!(Query::parse("language=de").is_err());
-        assert!(Query::parse("language:").is_err());
+        assert!(index.find(&"language:fr".parse().unwrap()).is_empty());
+        assert!("language=de".parse::<Query>().is_err());
+        assert!("language:".parse::<Query>().is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

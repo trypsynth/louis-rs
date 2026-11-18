@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use search_path::SearchPath;
 
-use louis::EmphasisSpan;
+use louis::Emphasis;
 use louis::internals::{
     parser::{self, Direction, TableError},
     translator::{
@@ -58,6 +58,13 @@ pub enum FailureReason {
         direction: Direction,
     },
     Position(PositionMismatch),
+    /// The text matched, but the emphasis of the output (its typeform) didn't
+    Emphasis {
+        input: String,
+        expected: Emphasis,
+        actual: Emphasis,
+        direction: Direction,
+    },
 }
 
 #[derive(PartialEq, Debug)]
@@ -86,7 +93,10 @@ impl TestResult {
         matches!(self, TestResult::Success)
     }
     pub fn is_translation_failure(&self) -> bool {
-        matches!(self, TestResult::Failure(FailureReason::Translation { .. }))
+        matches!(
+            self,
+            TestResult::Failure(FailureReason::Translation { .. } | FailureReason::Emphasis { .. })
+        )
     }
     pub fn is_position_failure(&self) -> bool {
         matches!(self, TestResult::Failure(FailureReason::Position(_)))
@@ -208,12 +218,10 @@ impl<'a> TestMatrix<'a> {
             }
             Table::Query(query) => {
                 let index = crate::index().map_err(|e| TestError::NotIndexable(e.to_string()))?;
-                let query = metadata::Query::from(query);
-                let matches: Vec<PathBuf> = index
-                    .find(query.clone())
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect();
+                let query: metadata::Query =
+                    query.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let matches: Vec<PathBuf> =
+                    index.find(&query).into_iter().map(PathBuf::from).collect();
                 match matches.as_slice() {
                     [] => return Err(TestError::NoTableForQuery(query.to_string())),
                     [path] => parser::table_expanded_in(path, &search_path)?,
@@ -377,8 +385,8 @@ pub struct Test {
     expected: String,
     /// Is the test expected to fail?
     xfail: ExpectedFailure,
-    emphasis: Vec<EmphasisSpan>,
-    expected_emphasis: Vec<EmphasisSpan>,
+    emphasis: Emphasis,
+    expected_emphasis: Option<Emphasis>,
     input_pos: Vec<usize>,
     output_pos: Vec<usize>,
     cursor_pos: Option<CursorPosition>,
@@ -390,14 +398,14 @@ pub struct Test {
 impl Test {
     fn check(&self, table: &TranslationPipeline, direction: Direction) -> TestResult {
         let mut options = TranslationOptions::default()
-            .with_mode(self.modes)
+            .with_modes(self.modes)
             .with_emphasis(self.emphasis.clone());
         if let Some(CursorPosition::Single(cursor) | CursorPosition::Tuple(cursor, _)) =
             self.cursor_pos
         {
-            options = options.with_cursor_pos(cursor);
+            options = options.with_cursor_position(cursor);
         }
-        let (translated, positions) = table.translate_with_positions(&self.input, &options);
+        let (translated, positions, emphasis) = table.translate_with_details(&self.input, &options);
         let matched = translated == self.expected;
         if matched {
             if self.xfail.is_failure(direction) {
@@ -407,8 +415,11 @@ impl Test {
                 }
             } else {
                 match self.position_mismatch(&positions, direction) {
-                    None => TestResult::Success,
                     Some(mismatch) => TestResult::Failure(FailureReason::Position(mismatch)),
+                    None => match self.emphasis_mismatch(emphasis.unwrap_or_default(), direction) {
+                        Some(failure) => TestResult::Failure(failure),
+                        None => TestResult::Success,
+                    },
                 }
             }
         } else if self.xfail.is_failure(direction) {
@@ -427,6 +438,17 @@ impl Test {
                 direction,
             })
         }
+    }
+
+    /// Compare the emphasis of the output, where the test gives one (`expected_typeform`)
+    fn emphasis_mismatch(&self, actual: Emphasis, direction: Direction) -> Option<FailureReason> {
+        let expected = self.expected_emphasis.as_ref()?;
+        (*expected != actual).then(|| FailureReason::Emphasis {
+            input: self.input.to_string(),
+            expected: expected.clone(),
+            actual,
+            direction,
+        })
     }
 
     fn position_mismatch(
@@ -468,8 +490,8 @@ impl Test {
         input: String,
         expected: String,
         xfail: ExpectedFailure,
-        emphasis: Vec<EmphasisSpan>,
-        expected_emphasis: Vec<EmphasisSpan>,
+        emphasis: Emphasis,
+        expected_emphasis: Option<Emphasis>,
         input_pos: Vec<usize>,
         output_pos: Vec<usize>,
         cursor_pos: Option<CursorPosition>,
@@ -541,8 +563,8 @@ mod tests {
             "ab".to_string(),
             "⠁⠃".to_string(),
             ExpectedFailure::default(),
-            vec![],
-            vec![],
+            Emphasis::default(),
+            None,
             input_pos,
             output_pos,
             cursor_pos,

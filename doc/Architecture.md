@@ -17,7 +17,8 @@ table files ──parse──▶ rules ──TableContext──▶ TranslationPi
                                                  │
    text ──▶ [correct] ──▶ main stage ──▶ [pass2] ──▶ [pass3] ──▶ [pass4] ──▶ [display] ──▶ braille
                              │
-                             ├─ before the loop:  indicators ─▶ indications per position
+                             ├─ before the loop:  spans: the caller's emphasis + compbrl words
+                             │                    indicators ─▶ indications per position
                              │                    constrainers ─▶ constraints per position
                              ├─ the loop, at each position:
                              │      candidates (trie, match, context, ...)
@@ -41,14 +42,18 @@ Backward (braille to text) runs the same stages in reverse order, the display ta
    this direction (`nofor`, `noback`), sorts the rest into stages by opcode, and compiles
    each stage, with the context, into a table: a `MultipassTable` for `correct` and each of
    `pass2` to `pass4`, a `PrimaryTable` for everything else. Backward, the stages are
-   reversed. A display table, if any, is added as the outermost stage.
+   reversed. A braille encoding (`BrailleEncoding`, from a liblouis display table), if
+   the caller gives one, is added as the outermost stage, a `DisplayTable`; a display
+   table a translation table includes is ignored.
 
 ### The main stage: `PrimaryTable::trace`
 
 `translator/table/primary.rs` holds nearly all of liblouis's opcodes. Translating with it
 has three phases.
 
-**Before the loop**, two kinds of precomputation run over the whole input:
+**Before the loop**, the emphasis spans the caller gave are joined, forward, by a
+`computer_braille` span for each word with a `compbrl` string in it (`CompbrlWords`). Then
+two kinds of precomputation run over the whole input:
 
 - **Indicators** (`indication/`) decide which indication *cells* go where: capital signs,
   number signs, emphasis, computer braille, mode and letter signs. The result,
@@ -59,7 +64,11 @@ has three phases.
   rule starts here" (`SyllableStart`) or "a hyphenation break falls here"
   (`HyphenationBreak`).
 
-Both read only the input text. Neither knows which rules will be chosen.
+Both read only the input text, the spans and the options. Neither knows which rules will
+be chosen. The modes are constrainers too: `noContractions` sets `Uncontracted`
+everywhere, and forward, with `compbrlAtCursor` or `compbrlLeftCursor`, the word at the
+cursor is computer braille (`UseComp6`) without indicators (`CursorWord`), and no rule
+reaches into it or joins onto it (`SpaceBeforeCursorWord`).
 
 **The loop** walks the input. At each position it:
 
@@ -75,9 +84,10 @@ Both read only the input text. Neither knows which rules will be chosen.
      and another the `comp6` rules;
    - **match patterns** (`match_pattern.rs`) for `match` rules, and **context patterns**
      (`context_pattern.rs`) for `context` rules, both compiled to the **regexp VM**
-     (`regexp.rs`, ADR-0007). A `match` rule's `pre` is checked backwards from the cursor.
-     A `context` rule whose test starts before its `[` is found early and kept as a
-     **delayed translation** until the cursor reaches the `[`;
+     (`regexp.rs`, ADR-0007). A `match` rule's `pre` and a `context` rule's look-behind
+     (a leading `_N`) are checked backwards from the cursor. A `context` rule with text
+     before its `[` is found early and kept as a **delayed translation** until the cursor
+     reaches the `[`;
 3. **filters** the candidates by the constraints at this position, and by checks the trie
    can't express (`prepunc`, `joinnum`, `repword`, ...);
 4. picks the best candidate by **`Rank`** (`translation.rs`, ADR-0016), applies it, records
@@ -87,7 +97,8 @@ Both read only the input text. Neither knows which rules will be chosen.
 
 **After the loop**, the **rewriters** (`indication.rs`, `Rewriters`) rewrite the chosen
 translations where the result depends on which rule was chosen: the `nocontractsign` and
-letter sign in front of a `contraction` applied (forward), and the capitals (backward).
+letter sign in front of a `contraction` applied and the spaces between two `largesign`s
+(forward), and the capitals (backward).
 
 ### The multipass stages
 
@@ -122,8 +133,10 @@ kept for `Rank` to choose from.
 **Regexp VM, match and context patterns.** A small regexp engine after Russ Cox's virtual
 machine, with liblouis's extras: attribute classes, swaps, variables. `match` and `context`
 rules, and every multipass rule, compile to it. The VM only runs forward; a look-behind, such
-as a `match` rule's `pre`, is compiled from the reversed pattern (`Regexp::reverse`) and
-run over the reversed text before the cursor, as liblouis does.
+as a `match` rule's `pre` or a `context` rule's leading `_N`, is compiled from the reversed
+pattern (`Regexp::reverse`) and run over the reversed text before the cursor, as liblouis
+does for `pre`. A trailing `_N` is a look-ahead: matched after the consumed span. The parser
+turns `_N` into these two (`Test`'s `lookbehind`, `body`, `lookahead`) and rejects any other.
 
 **Indicator.** Decides from the text alone where indication cells go, before translation.
 One per kind of indication: `uppercase`, `numeric`, `emphasis`, `computer_braille`,
@@ -137,9 +150,10 @@ number sign, and so on.
 
 **Rewriter.** Rewrites the chosen translations after the loop, where the result depends on
 the rule chosen rather than on the text. It may insert translations or change them:
-`ContractionSigns` puts a chosen contraction's signs in front of it (forward),
-`BackwardCaps` uppercases after a chosen `capsletter` or `begcapsword` (backward). A table
-holds them as `Rewriters`, applied in turn.
+`ContractionSigns` puts a chosen contraction's signs in front of it and `LargeSigns` drops
+the spaces between two large signs (forward), `BackwardCaps` uppercases after a chosen
+`capsletter` or `begcapsword` (backward). A table holds them as `Rewriters`, applied in
+turn.
 
 **`Rank`, `Precedence`.** How the loop picks between candidates at the same position: a
 key compared field by field. Roughly: a forward `context` rule with no leading literal
@@ -150,12 +164,13 @@ output, `nocross`, a `context` rule's test, and finally the earliest definition.
 of the fields is the order of precedence; ADR-0016 has the reasoning, and the doc comments
 on `Rank` the details.
 
-**Effects, environment.** The variables a `context` or multipass rule tests and sets
-(`#1=0`), carried along one stage's loop.
+**Effects, environment.** The variables a `context` or multipass rule sets (`#1=0`,
+`#1+`, `#1-`) and tests (`#1=3`, `#1<3`, ...), carried along one stage's loop. A
+variable that was never set is 0.
 
-**Scanners.** Small helpers the trie consults for a transition that needs more than the
-neighbouring character: `BegWordScanner` and `EndWordScanner` (backward word boundaries),
-`StandingAloneScanner` (`seqdelimiter` sequences).
+**Scanners.** Small helpers that look further than the neighbouring character. The trie
+consults `BegWordScanner` and `EndWordScanner` (backward word boundaries) and
+`StandingAloneScanner` (`seqdelimiter` sequences) for its transitions.
 
 ## Where does new logic go?
 
@@ -190,6 +205,11 @@ Backward translation runs the same machinery over braille, with these difference
 - **`Rank`** prefers the rule that writes more text, as liblouis sorts its backward rules.
 - **Capitals** are applied by the `BackwardCaps` rewriter, with the table's
   `base uppercase` rules.
+- **Emphasis** comes out as the typeform, `TranslationResult::emphasis`:
+  `backward_emphasis` reads the emphasis indicators chosen in the main stage, and the
+  pipeline carries the result over the stages after it with the position map.
+- **Partial input** (`partialTrans`): no word ends anywhere, so the trie's `EndWord` never
+  holds and `ContinuesWord` always does, and `word` and `lowword` rules don't apply.
 
 ## Further reading
 
@@ -198,5 +218,5 @@ Backward translation runs the same machinery over braille, with these difference
   VM), ADR-0016 (`Rank`).
 - [Differences from liblouis](Differences_From_Liblouis.md): where louis-rs deliberately
   does something else.
-- [Liblouis parity](Liblouis_Parity.md): what works, what doesn't, and where the remaining
-  failures are.
+- [Liblouis parity](Liblouis_Parity.md): how close louis-rs is to liblouis, and what it
+  still does differently.

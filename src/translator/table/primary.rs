@@ -4,7 +4,6 @@ use log::warn;
 
 use crate::{
     Direction,
-    emphasis::EmphasisSpan,
     parser::{
         AnchoredRule, Braille, BrailleChar, BrailleChars, CharacterClass, CharacterClasses,
         HasDirection, HasNocross, WithClass, in_definition_order,
@@ -19,16 +18,19 @@ use crate::{
         indication::{
             Indicator, Indicators, PrecomputedIndications, Rewriter, Rewriters, computer_braille,
             contraction::ContractionSignsBuilder,
-            emphasis, lettersign, mode, numeric,
+            emphasis,
+            largesign::LargeSigns,
+            lettersign, mode, numeric,
             uppercase::{self, BackwardCapsBuilder},
         },
         match_pattern::{MatchPatterns, MatchPatternsBuilder},
         position_constraints::{
             BackwardNoContractConstrainerBuilder, BackwardNumericConstrainerBuilder,
             CapsNoContConstrainerBuilder, ComputerBrailleConstrainer, Constrainer, Constrainers,
-            Constraint, HyphenationConstrainerBuilder, JoinConstrainerBuilder,
-            NoContConstrainerBuilder, NumericConstrainerBuilder, PositionConstraints,
-            PunctuationConstrainerBuilder, RepwordConstrainerBuilder, SyllableConstrainerBuilder,
+            Constraint, CursorWordConstrainer, HyphenationConstrainerBuilder,
+            JoinConstrainerBuilder, NoContConstrainerBuilder, NoContractionsConstrainer,
+            NumericConstrainerBuilder, PositionConstraints, PunctuationConstrainerBuilder,
+            RepwordConstrainerBuilder, SyllableConstrainerBuilder,
         },
         standing_alone::StandingAloneScanner,
         table::TableContext,
@@ -62,58 +64,6 @@ fn unknown_hex(ch: char) -> String {
 /// dots. Returns `None` for a character that is not a braille cell.
 fn unknown_dots(ch: char) -> Option<String> {
     BrailleChar::from_unicode(ch).map(|cell| format!("\\{}/", cell.dot_numbers()))
-}
-
-/// Detects compbrl-triggered computer braille regions and adds `computer_braille` spans.
-///
-/// When a table contains `compbrl` rules, any word in the input that contains one
-/// of the trigger strings is treated as a computer braille span.
-#[derive(Debug, Clone)]
-struct CompbrlScanner {
-    triggers: Vec<String>,
-    character_classes: CharacterClasses,
-}
-
-impl CompbrlScanner {
-    fn enrich(&self, input: &str, caller_spans: &[EmphasisSpan]) -> Vec<EmphasisSpan> {
-        let chars: Vec<char> = input.chars().collect();
-        let n = chars.len();
-        let mut spans = caller_spans.to_vec();
-
-        let mut pos = 0;
-        while pos < n {
-            // Check if any trigger matches at this character position, without copying
-            // the rest of the input, which made this quadratic in its length.
-            let matched = self.triggers.iter().any(|t| {
-                let mut rest = chars[pos..].iter();
-                t.chars().all(|c| rest.next() == Some(&c))
-            });
-            if matched {
-                // Expand to surrounding word: scan backward for whitespace.
-                let mut word_start = pos;
-                while word_start > 0 && !self.character_classes.is_whitespace(chars[word_start - 1])
-                {
-                    word_start -= 1;
-                }
-                // Scan forward for whitespace.
-                let mut word_end = pos;
-                while word_end < n && !self.character_classes.is_whitespace(chars[word_end]) {
-                    word_end += 1;
-                }
-                let new_span = EmphasisSpan::new("computer_braille", word_start..word_end);
-                // Avoid exact duplicates.
-                if !spans.contains(&new_span) {
-                    spans.push(new_span);
-                }
-                // Skip to end of word to avoid adding duplicate spans for the same word.
-                pos = word_end;
-            } else {
-                pos += 1;
-            }
-        }
-
-        spans
-    }
 }
 
 #[derive(Debug)]
@@ -158,7 +108,8 @@ pub struct PrimaryTable {
     indicators: Indicators,
     constrainers: Constrainers,
     /// Detects compbrl-triggered computer braille regions.
-    compbrl_scanner: Option<CompbrlScanner>,
+    compbrl_words: Option<computer_braille::CompbrlWords>,
+    /// Forward, finds the word at the cursor (`compbrlAtCursor`)
     direction: Direction,
     /// Backward-only: overrides the trie's default (letter) reading for a braille cell
     /// that is shared between a digit and a letter, keyed by the cell itself. Consulted
@@ -185,6 +136,8 @@ struct PrimaryTableBuilder {
     mode_indicator: mode::IndicatorBuilder,
     lettersign_indicator: lettersign::IndicatorBuilder,
     contraction_signs: ContractionSignsBuilder,
+    /// Whether the table has `largesign` rules, whose spaces `LargeSigns` drops
+    largesigns: bool,
     emphasis_indicator: emphasis::IndicatorBuilder,
     computer_braille_indicator: computer_braille::IndicatorBuilder,
     numeric_constrainer: NumericConstrainerBuilder,
@@ -247,6 +200,7 @@ impl PrimaryTableBuilder {
             mode_indicator: mode::IndicatorBuilder::new(),
             lettersign_indicator: lettersign::IndicatorBuilder::new(),
             contraction_signs: ContractionSignsBuilder::new(),
+            largesigns: false,
             emphasis_indicator: emphasis::IndicatorBuilder::new(),
             computer_braille_indicator: computer_braille::IndicatorBuilder::new(),
             numeric_constrainer: NumericConstrainerBuilder::new(),
@@ -462,19 +416,24 @@ impl PrimaryTableBuilder {
         .flatten()
         .collect();
         PrimaryTable {
-            rewriters: Rewriters::new(match direction {
-                Direction::Forward => self
-                    .contraction_signs
-                    .build()
-                    .map(Rewriter::ContractionSigns)
-                    .into_iter()
-                    .collect(),
-                Direction::Backward => {
-                    vec![Rewriter::BackwardCaps(
-                        self.backward_caps.build(ctx, self.uppercase_letters),
-                    )]
-                }
-            }),
+            rewriters: Rewriters::new(
+                [
+                    (direction == Direction::Forward)
+                        .then(|| self.contraction_signs.build())
+                        .flatten()
+                        .map(Rewriter::ContractionSigns),
+                    (direction == Direction::Forward && self.largesigns)
+                        .then(|| Rewriter::LargeSigns(LargeSigns::new(ctx.character_classes()))),
+                    (direction == Direction::Backward).then(|| {
+                        Rewriter::BackwardCaps(
+                            self.backward_caps.build(ctx, self.uppercase_letters),
+                        )
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
             undefined: self.undefined,
             character_translations: self.character_translations,
             direction,
@@ -529,14 +488,25 @@ impl PrimaryTableBuilder {
                         .then(|| self.repword_constrainer.build())
                         .flatten()
                         .map(Constrainer::Repword),
+                    // liblouis honours `noContractions` forward only
+                    (direction == Direction::Forward)
+                        .then_some(Constrainer::NoContractions(NoContractionsConstrainer)),
+                    (direction == Direction::Forward).then(|| {
+                        Constrainer::CursorWord(CursorWordConstrainer {
+                            character_classes: ctx.character_classes.clone(),
+                        })
+                    }),
                 ]
                 .into_iter()
                 .flatten()
                 .collect(),
             ),
-            compbrl_scanner: (!triggers.is_empty()).then(|| CompbrlScanner {
-                triggers,
-                character_classes: ctx.character_classes.clone(),
+            // forward only, as in liblouis, whose back-translation has no compbrl
+            compbrl_words: (direction == Direction::Forward && !triggers.is_empty()).then(|| {
+                computer_braille::CompbrlWords {
+                    triggers,
+                    character_classes: ctx.character_classes.clone(),
+                }
             }),
             backward_digit_overrides: self.backward_digit_overrides,
         }
@@ -625,6 +595,27 @@ impl PrimaryTable {
         // liblouis decides by table order, and tables put the `always` rule first to override
         // the punctuation (`pu-in-g1.utb`: "needed to override ! in en-in-g1.ctb"); without
         // this the word-boundary transition would give the punctuation rule the higher weight
+        // liblouis looks for a character's own rules before it derives it from a `base`
+        // rule, so a character defined in its own right translates by that definition,
+        // whatever the order; the `base` rule only adds its class
+        let defined_characters: HashSet<char> = rules
+            .iter()
+            .filter(|rule| rule.rule.is_direction(direction))
+            .filter_map(|rule| match &rule.rule {
+                Rule::Space { character, .. }
+                | Rule::Punctuation { character, .. }
+                | Rule::Digit { character, .. }
+                | Rule::Litdigit { character, .. }
+                | Rule::Letter { character, .. }
+                | Rule::Lowercase { character, .. }
+                | Rule::Uppercase { character, .. }
+                | Rule::Sign { character, .. }
+                | Rule::Math { character, .. }
+                | Rule::Hyphen { character, .. }
+                | Rule::Decpoint { character, .. } => Some(*character),
+                _ => None,
+            })
+            .collect();
         let always_cells: HashSet<String> = rules
             .iter()
             .filter_map(|rule| match &rule.rule {
@@ -1141,7 +1132,7 @@ impl PrimaryTable {
                         let dots = match replacement {
                             Some(replacement) => ctx
                                 .character_definitions()
-                                .braille_to_unicode(&Braille::Implicit, replacement)?,
+                                .braille_to_unicode(&Braille::Implicit, replacement).map_err(|e| e.at(rule))?,
                             None => String::new(),
                         };
                         builder.get_trie_mut(rule).insert(
@@ -1161,7 +1152,7 @@ impl PrimaryTable {
                     if direction == Direction::Forward {
                         let dots = ctx
                             .character_definitions()
-                            .braille_to_unicode(&Braille::Implicit, chars)?;
+                            .braille_to_unicode(&Braille::Implicit, chars).map_err(|e| e.at(rule))?;
                         builder.get_trie_mut(rule).insert(
                             chars,
                             &dots,
@@ -1203,6 +1194,7 @@ impl PrimaryTable {
                         // Backward, as in liblouis, the derived character has no dots of
                         // its own: the dots give the base, which a capital sign uppercases.
                         match direction {
+                            Direction::Forward if defined_characters.contains(derived) => {}
                             Direction::Forward => builder.insert_character(
                                 *derived,
                                 &translation,
@@ -1226,7 +1218,7 @@ impl PrimaryTable {
                     let character = character.to_string();
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, &character)?;
+                        .braille_to_unicode(dots, &character).map_err(|e| e.at(rule))?;
                     builder.comp6_trie.insert(
                         &character,
                         &dots,
@@ -1265,7 +1257,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
                     builder.get_trie_mut(rule).insert(
                         chars,
@@ -1284,7 +1276,7 @@ impl PrimaryTable {
                     builder.syllable_constrainer.syllable(chars);
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots,
@@ -1316,6 +1308,7 @@ impl PrimaryTable {
                     builder.compbrl_triggers.push(chars.clone());
                 }
                 Rule::Largesign { chars, dots } => {
+                    builder.largesigns = true;
                     builder.lettersign_indicator.single_letter_word(chars);
                     builder.get_trie_mut(rule).insert(
                         chars,
@@ -1337,7 +1330,7 @@ impl PrimaryTable {
                     builder.lettersign_indicator.single_letter_word(chars);
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
                     builder.get_trie_mut(rule).insert(
                         chars,
@@ -1358,7 +1351,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
                     builder.get_trie_mut(rule).insert(
                         chars,
@@ -1382,7 +1375,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     if direction == Direction::Backward {
                         builder.backward_numeric_constrainer.after_letter(&dots);
                     }
@@ -1410,7 +1403,7 @@ impl PrimaryTable {
                     // 2. at word-start followed by word char (begword)
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
                     builder.get_trie_mut(rule).insert(
                         chars,
@@ -1441,7 +1434,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     if direction == Direction::Backward {
                         builder.backward_numeric_constrainer.after_letter(&dots);
                     }
@@ -1474,7 +1467,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     if direction == Direction::Backward {
                         builder.backward_numeric_constrainer.after_letter(&dots);
                     }
@@ -1498,7 +1491,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
                     // a prfword is basically syntactic sugar for a word rule combined with an
                     // endword rule. So just make the two appropriate insertions in the trie
@@ -1534,7 +1527,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
                     // forward, a sufword is basically syntactic sugar for a word rule combined
                     // with a begword rule; backward, liblouis checks nothing after it
@@ -1572,7 +1565,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
                     builder.get_trie_mut(rule).insert(
                         chars,
@@ -1656,7 +1649,7 @@ impl PrimaryTable {
                 Rule::Endnum { chars, dots, .. } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     if direction == Direction::Backward {
                         builder.backward_numeric_constrainer.endnum(&dots);
                     }
@@ -1787,7 +1780,7 @@ impl PrimaryTable {
                 } => {
                     let dots = ctx
                         .character_definitions()
-                        .braille_to_unicode(dots, chars)?;
+                        .braille_to_unicode(dots, chars).map_err(|e| e.at(rule))?;
                     builder.match_patterns.insert(
                         pre,
                         chars,
@@ -1965,7 +1958,8 @@ impl PrimaryTable {
                     | Rule::Partword { chars, dots, .. } => {
                         let dots = ctx
                             .character_definitions()
-                            .braille_to_unicode(dots, chars)?;
+                            .braille_to_unicode(dots, chars)
+                            .map_err(|e| e.at(rule))?;
                         builder.backward_numeric_constrainer.rule_dots(&dots);
                         // an `always` rule takes an indicator's dots as its own, where the
                         // word-family rules would only be kept off the letters after it
@@ -2109,9 +2103,10 @@ impl PrimaryTable {
         &self,
         input: &str,
         preceding: &str,
+        partial: bool,
     ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
         self.trie
-            .find_translations(input, preceding)
+            .find_translations_partial(input, preceding, partial)
             .into_iter()
             .partition(|t| t.offset() == 0)
     }
@@ -2126,9 +2121,10 @@ impl PrimaryTable {
         preceding: &str,
         char_pos: usize,
         constraints: &PositionConstraints,
+        partial: bool,
     ) -> Vec<ResolvedTranslation> {
         self.nocross_trie
-            .find_translations(input, preceding)
+            .find_translations_partial(input, preceding, partial)
             .into_iter()
             .filter(|t| {
                 !(char_pos..char_pos + t.length().saturating_sub(1))
@@ -2156,11 +2152,12 @@ impl PrimaryTable {
     fn context_candidates(
         &self,
         input: &str,
+        preceding: &str,
         env: &Environment,
         at_start: bool,
     ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
         self.context_patterns
-            .find(input, env, at_start, &self.fallback_definitions)
+            .find(input, preceding, env, at_start, &self.fallback_definitions)
             .into_iter()
             .partition(|t| t.offset() == 0)
     }
@@ -2173,6 +2170,9 @@ impl PrimaryTable {
     }
 
     pub fn trace(&self, input: &str, options: &TranslationOptions) -> Vec<ResolvedTranslation> {
+        // back-translating input that may end in the middle of a word (`partialTrans`)
+        let partial = self.direction == Direction::Backward
+            && options.modes().contains(TranslationMode::PartialTrans);
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
         let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
 
@@ -2192,18 +2192,21 @@ impl PrimaryTable {
         // read backwards: the end of this, see `MatchPatterns::find`.
         let reversed: String = input.chars().rev().collect();
 
-        // Enrich spans with compbrl-detected regions.
-        let enriched_spans = match &self.compbrl_scanner {
-            Some(scanner) => scanner.enrich(input, options.emphasis()),
-            None => options.emphasis().to_vec(),
+        // the caller's emphasis, and the words a `compbrl` string puts in computer braille
+        let spans = match &self.compbrl_words {
+            Some(words) => words.spans(input, options.emphasis().spans()),
+            None => options.emphasis().spans().to_vec(),
         };
 
-        let indications = self.indicators.precompute(input, &enriched_spans);
-        let constraints = self.constrainers.precompute(input, &enriched_spans);
+        let indications = self.indicators.precompute(input, &spans);
+        let constraints = self.constrainers.precompute(input, &spans, options);
 
         loop {
             if last_pos != Some(char_pos) {
-                translations.extend(indications.translations_at(char_pos));
+                // nor any other indicator in the word at the cursor
+                if !constraints.in_cursor_word_at(char_pos) {
+                    translations.extend(indications.translations_at(char_pos));
+                }
                 seen.clear();
                 last_pos = Some(char_pos);
             }
@@ -2227,14 +2230,41 @@ impl PrimaryTable {
 
             // First check for nocross candidates
             let nocross_candidate = self
-                .nocross_candidates(chars.as_str(), preceding, char_pos, &constraints)
+                .nocross_candidates(chars.as_str(), preceding, char_pos, &constraints, partial)
                 .into_iter()
                 .filter(|t| !(constraints.uncontracted_at(char_pos) && Self::contracts(t)))
+                // not in or into the word at the cursor, which is computer braille
+                .filter(|t| {
+                    !constraints.in_cursor_word_at(char_pos)
+                        && !constraints.reaches_into_cursor_word(char_pos, t.length())
+                })
                 .max_by_key(|t| t.rank(self.direction));
 
             // given an input query the trie for matching translations. Then split off the
             // translations that are delayed, i.e. have an offset because they have a pre-pattern
-            let (mut candidates, delayed) = self.translation_candidates(chars.as_str(), preceding);
+            let (mut candidates, delayed) =
+                self.translation_candidates(chars.as_str(), preceding, partial);
+            // nor do rules for whole words apply to a word that may go on
+            if partial {
+                candidates.retain(|t| {
+                    !matches!(t.rule(), Some(Rule::Word { .. } | Rule::Lowword { .. }))
+                });
+                // a `joinword` puts back the space before the word it joins, which hasn't
+                // been typed yet at the end of the input
+                let remaining = chars.as_str().chars().count();
+                candidates = candidates
+                    .into_iter()
+                    .map(|t| match t.rule() {
+                        Some(Rule::Joinword { .. } | Rule::Joinnum { .. })
+                            if t.length() == remaining =>
+                        {
+                            let output = t.output();
+                            t.with_output(output.trim_end_matches(' '))
+                        }
+                        _ => t,
+                    })
+                    .collect();
+            }
             delayed_translations.extend(delayed);
 
             // then the match patterns, which all match at the cursor: `pre` is checked
@@ -2243,10 +2273,11 @@ impl PrimaryTable {
             let reversed_preceding = &reversed[input.len() - cursor_byte..];
             candidates.extend(self.match_patterns.find(chars.as_str(), reversed_preceding));
 
-            // then search for context patterns. Unless they have empty pre patterns they will all
-            // have an offset. Split those off.
+            // then search for context patterns, their look-behind checked backwards from the
+            // cursor like `pre`. Those with text before the brackets have an offset. Split
+            // those off.
             let (context_candidates, context_delayed) =
-                self.context_candidates(chars.as_str(), &env, at_start);
+                self.context_candidates(chars.as_str(), reversed_preceding, &env, at_start);
             delayed_translations.extend(context_delayed);
             // merge the candidates from the context patters with the candidates from the plain translations
             candidates.extend(context_candidates);
@@ -2337,6 +2368,15 @@ impl PrimaryTable {
                     )
                 });
             }
+
+            // No rule reaches into the word at the cursor, and none joins onto it
+            let joins_cursor_word = |t: &ResolvedTranslation| {
+                matches!(t.rule(), Some(Rule::Joinword { .. } | Rule::Joinnum { .. }))
+                    && constraints.joins_cursor_word_at(char_pos + t.length())
+            };
+            candidates.retain(|t| {
+                !constraints.reaches_into_cursor_word(char_pos, t.length()) && !joins_cursor_word(t)
+            });
 
             // In computer braille mode, discard normal candidates and use comp6 rules only.
             // comp6 rules have no pre-pattern so offset() is always 0 — no delayed handling needed.
@@ -2494,8 +2534,9 @@ impl PrimaryTable {
     }
 
     /// Whether `t` comes from an opcode that liblouis switches off in a word with a
-    /// `nocont` string (its dontContract). Character definitions, `prepunc`/`postpunc`,
-    /// `context` and the number opcodes still apply there.
+    /// `nocont` string or with `noContractions` (its dontContract). Character
+    /// definitions, `prepunc`/`postpunc`, `context` and the number opcodes still apply
+    /// there.
     fn contracts(t: &ResolvedTranslation) -> bool {
         matches!(
             t.rule(),
@@ -2518,6 +2559,7 @@ impl PrimaryTable {
                     | Rule::Midword { .. }
                     | Rule::Midendword { .. }
                     | Rule::Endword { .. }
+                    | Rule::Match { .. }
             )
         )
     }
@@ -2671,7 +2713,7 @@ impl PrimaryTable {
     }
 
     fn handle_undefined_char(&self, ch: char, options: &TranslationOptions) -> String {
-        if options.mode().contains(TranslationMode::NoUndefined) {
+        if options.modes().contains(TranslationMode::NoUndefined) {
             // the caller asked for undefined input to be dropped
             return String::new();
         }
@@ -2743,6 +2785,7 @@ fn fallback(ch: char) -> BrailleChars {
 mod tests {
     use super::*;
 
+    use crate::emphasis::EmphasisSpan;
     use search_path::SearchPath;
 
     use crate::parser::{RuleParser, expand_includes};
@@ -2774,13 +2817,13 @@ mod tests {
         let table =
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
-        let scanner = table.compbrl_scanner.as_ref().unwrap();
+        let words = table.compbrl_words.as_ref().unwrap();
         assert_eq!(
-            scanner.enrich("a awww", &[]),
+            words.spans("a awww", &[]),
             [EmphasisSpan::new("computer_braille", 2..6)]
         );
         // fewer characters are left than the trigger has
-        assert_eq!(scanner.enrich("a ww", &[]), []);
+        assert_eq!(words.spans("a ww", &[]), []);
     }
 
     /// A [`SearchPath`] rooted at the crate directory, for tests that `include` one of the

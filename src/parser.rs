@@ -109,11 +109,10 @@ impl std::fmt::Display for Constraints {
 /// A set of [`Constraints`](Constraint) that contains both directions
 const ANY_DIRECTION: Constraints = constraint_set!(Constraint::Nofor | Constraint::Noback);
 
-/// A direction for a `Rule`.
+/// Which way a translation goes: from text to braille, or from braille back to text.
 ///
-/// Rules always have at least one direction. They are used for
-/// forward translation, for backward translation or for both
-/// directions. The concept of direction is related to `Constraint`.
+/// A [`Translator`](crate::Translator) translates in one direction. A table's rules apply in
+/// both unless they are restricted with `nofor` or `noback`.
 // no_ops: no `|` that would return an `EnumSet` and put enumset in the API
 #[derive(EnumSetType, Debug, Default, Hash)]
 #[enumset(no_ops)]
@@ -144,18 +143,18 @@ type WithMatches = HashSet<WithMatch>;
 /// An error that occurred during parsing of a [liblouis](https://liblouis.io) braille table
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ParseError {
-    #[error("Expected {expected:?}, got {found:?}")]
+    #[error("expected {expected:?}, got {found:?}")]
     TokenExpected {
         expected: String,
         found: Option<String>,
     },
-    #[error("Invalid braille")]
+    #[error("invalid braille")]
     InvalidBraille(#[from] braille::ParseError),
-    #[error("Braille expected")]
+    #[error("braille expected")]
     DotsExpected,
-    #[error("Comma separated tuple of Braille expected")]
+    #[error("comma separated tuple of Braille expected")]
     DotsTupleExpected,
-    #[error("Same number of replacements in swap opcode expected ({0} vs {1})")]
+    #[error("same number of replacements in swap opcode expected ({0} vs {1})")]
     SameNumberOfSwapReplacementsExpected(usize, usize),
     #[error("{found:?} is a multi-cell dot pattern, but only single cells are allowed here")]
     SingleCellDotsExpected { found: String },
@@ -165,38 +164,38 @@ pub enum ParseError {
     InvalidNumber(#[from] ParseIntError),
     #[error("invalid escape sequence {0:?}")]
     InvalidEscape(Option<char>),
-    #[error("Names can only contain a-z and A-Z, got {name:?}")]
+    #[error("names can only contain a-z and A-Z, got {name:?}")]
     InvalidName { name: String },
-    #[error("Constraints '{constraints:?}' not allowed for opcode {opcode:?}.")]
+    #[error("constraints '{constraints:?}' not allowed for opcode {opcode:?}")]
     InvalidConstraints {
         constraints: Constraints,
         opcode: Opcode,
     },
-    #[error("Expected classname, got {found:?}")]
+    #[error("expected classname, got {found:?}")]
     ClassNameExpected { found: Option<String> },
-    #[error("Opcode expected, got {found:?}")]
+    #[error("opcode expected, got {found:?}")]
     OpcodeExpected { found: Option<String> },
-    #[error("Name expected")]
+    #[error("name expected")]
     NameExpected,
-    #[error("Characters expected")]
+    #[error("characters expected")]
     CharsExpected,
-    #[error("Filename expected")]
+    #[error("filename expected")]
     FilenameExpected,
-    #[error("Number expected, got {found:?}")]
+    #[error("number expected, got {found:?}")]
     NumberExpected { found: Option<String> },
-    #[error("Multipass test expected")]
+    #[error("multipass test expected")]
     MultipassTestExpected,
-    #[error("Multipass action expected")]
+    #[error("multipass action expected")]
     MultipassActionExpected,
-    #[error("Invalid multipass operand: {0}")]
+    #[error("invalid multipass operand: {0}")]
     InvalidMultipassOperand(#[from] multipass::ParseError),
-    #[error("Invalid match pattern: {0}")]
+    #[error("invalid match pattern: {0}")]
     InvalidMatchPattern(#[from] match_rule::ParseError),
-    #[error("Match pre-pattern expected")]
+    #[error("match pre-pattern expected")]
     MatchPreExpected,
-    #[error("Match post-pattern expected")]
+    #[error("match post-pattern expected")]
     MatchPostExpected,
-    #[error("Expected a single char, got {found:?}")]
+    #[error("expected a single char, got {found:?}")]
     SingleCharExpected { found: Option<String> },
 }
 
@@ -2630,13 +2629,22 @@ enum SyntaxErrorKind {
     Hyphenation(hyphenation::ParseError),
 }
 
+/// The start of a syntax error's message: the table and a colon, or `line ` for table
+/// source given in memory
+fn location(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(path) => format!("{}:", path.display()),
+        None => "line ".to_string(),
+    }
+}
+
 /// An error that occurred during reading of a [liblouis](https://liblouis.io) braille table
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum TableError {
     /// A line of a table could not be parsed
-    #[error("line {line}: {error}")]
-    ParseError {
+    #[error("{}{line}: {error}", location(.path))]
+    Syntax {
         /// The table, or `None` for table source given in memory
         path: Option<PathBuf>,
         /// The line number, counting from 1
@@ -2645,33 +2653,33 @@ pub enum TableError {
         error: SyntaxError,
     },
     /// Table source given in memory has an `include`, which needs the filesystem
-    #[error("Include directives are not supported when parsing table source in memory")]
+    #[error("include directives are not supported when parsing table source in memory")]
     IncludesNotSupportedInMemory,
     /// A table was found but could not be read
-    #[error("Cannot read table {path}: {error}")]
-    TableNotReadable {
+    #[error("cannot read table {path}: {error}")]
+    NotReadable {
         /// The table
         path: PathBuf,
         /// Why it could not be read
         error: io::Error,
     },
     /// A table is not on the search path
-    #[error("Cannot find table {0:?}")]
-    TableNotFound(PathBuf),
+    #[error("cannot find table {0}")]
+    NotFound(PathBuf),
     /// A hyphenation table is not on the search path
-    #[error("Hyphenation table {0} not found")]
-    HyphenationTableNotFound(PathBuf),
+    #[error("hyphenation table {0} not found")]
+    HyphenationNotFound(PathBuf),
     /// A hyphenation table was found but could not be read
-    #[error("Cannot read hyphenation table {path}: {error}")]
-    HyphenationTableNotReadable {
+    #[error("cannot read hyphenation table {path}: {error}")]
+    HyphenationNotReadable {
         /// The hyphenation table
         path: PathBuf,
         /// Why it could not be read
         error: io::Error,
     },
     /// A hyphenation table could not be parsed
-    #[error("Cannot parse hyphenation table {path}: {error}")]
-    HyphenationTableNotParseable {
+    #[error("cannot parse hyphenation table {path}: {error}")]
+    HyphenationSyntax {
         /// The hyphenation table
         path: PathBuf,
         /// What is wrong with it
@@ -2729,6 +2737,16 @@ impl AnchoredRule {
     pub fn definition_order(&self) -> usize {
         self.definition_order
     }
+
+    /// The table the rule comes from, or `None` for table source given in memory
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The line the rule is on, counting from 1
+    pub fn line(&self) -> usize {
+        self.line
+    }
 }
 
 impl HasDirection for AnchoredRule {
@@ -2784,7 +2802,7 @@ pub fn table(table: &str, path: Option<PathBuf>) -> Result<Vec<AnchoredRule>, Ve
             RuleParser::new(line)
                 .rule()
                 .map(|rule| AnchoredRule::new(rule, path.clone(), line_no + 1))
-                .map_err(|e| TableError::ParseError {
+                .map_err(|e| TableError::Syntax {
                     path: path.clone(),
                     line: line_no + 1,
                     error: SyntaxError(SyntaxErrorKind::Rule(e)),
@@ -2802,7 +2820,7 @@ pub fn table(table: &str, path: Option<PathBuf>) -> Result<Vec<AnchoredRule>, Ve
 
 pub fn table_file(path: &Path) -> Result<Vec<AnchoredRule>, Vec<TableError>> {
     let text = read_to_string(path).map_err(|error| {
-        vec![TableError::TableNotReadable {
+        vec![TableError::NotReadable {
             path: path.into(),
             error,
         }]
@@ -2834,7 +2852,7 @@ fn table_expanded_with(
     match search_path.find_file(file) {
         Some(path) => {
             let canonical = path.canonicalize().map_err(|error| {
-                vec![TableError::TableNotReadable {
+                vec![TableError::NotReadable {
                     path: path.clone(),
                     error,
                 }]
@@ -2851,7 +2869,7 @@ fn table_expanded_with(
             chain.push(canonical);
             table_file(path.as_path()).and_then(|rules| expand_includes(rules, search_path, &chain))
         }
-        None => Err(vec![TableError::TableNotFound(file.into())]),
+        None => Err(vec![TableError::NotFound(file.into())]),
     }
 }
 
@@ -2869,15 +2887,15 @@ fn expand_include(
                 // parse them with their own parser and embed the result.
                 let resolved = search_path
                     .find_file(path)
-                    .ok_or(vec![TableError::HyphenationTableNotFound(path.into())])?;
+                    .ok_or(vec![TableError::HyphenationNotFound(path.into())])?;
                 let source = read_to_string(&resolved).map_err(|error| {
-                    vec![TableError::HyphenationTableNotReadable {
+                    vec![TableError::HyphenationNotReadable {
                         path: resolved.clone(),
                         error,
                     }]
                 })?;
                 let table = HyphenationTable::parse(&source).map_err(|error| {
-                    vec![TableError::HyphenationTableNotParseable {
+                    vec![TableError::HyphenationSyntax {
                         path: resolved,
                         error: SyntaxError(SyntaxErrorKind::Hyphenation(error)),
                     }]

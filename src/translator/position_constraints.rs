@@ -1,7 +1,8 @@
 //! Per-position translation constraints
 //!
-//! A [`Constrainers`] collection analyses the input text before translation begins and
-//! produces a [`PositionConstraints`] value. The translation loop consults this
+//! A [`Constrainers`] collection analyses the input text, the emphasis spans and the
+//! translation options before translation begins and produces a [`PositionConstraints`]
+//! value. The translation loop consults this
 //! to decide which rules are eligible at each character position.
 //!
 //! The constrainer types are:
@@ -11,8 +12,12 @@
 use enumset::{EnumSet, EnumSetType};
 use std::collections::HashSet;
 
+use std::ops::Range;
+
 use crate::emphasis::EmphasisSpan;
 use crate::hyphenation::HyphenationTable;
+use crate::parser::CharacterClasses;
+use crate::translator::{TranslationMode, TranslationOptions};
 
 /// A rule-selection constraint that can be set at a character position.
 #[derive(EnumSetType, Debug)]
@@ -82,6 +87,13 @@ pub enum Constraint {
     /// the first one that a `repword`/`rependword` separator repeats, in forward
     /// translation.
     Repetition,
+    /// This position is in the word at the cursor, which `compbrlAtCursor` or
+    /// `compbrlLeftCursor` shows in computer braille, in forward translation: no rule
+    /// reaches into it, and no indicator goes in it.
+    CursorWord,
+    /// This position is in the run of whitespace right before the word at the cursor, so a
+    /// `joinword` or `joinnum` just before it would join onto that word.
+    SpaceBeforeCursorWord,
 }
 
 pub type Constraints = EnumSet<Constraint>;
@@ -153,6 +165,25 @@ impl PositionConstraints {
         self.0
             .get(pos)
             .is_some_and(|f| f.contains(Constraint::Uncontracted))
+    }
+
+    pub fn in_cursor_word_at(&self, pos: usize) -> bool {
+        self.0
+            .get(pos)
+            .is_some_and(|f| f.contains(Constraint::CursorWord))
+    }
+
+    /// Whether a translation of `length` characters at `pos` reaches into the word at the
+    /// cursor from outside it
+    pub fn reaches_into_cursor_word(&self, pos: usize, length: usize) -> bool {
+        !self.in_cursor_word_at(pos) && (pos..pos + length).any(|p| self.in_cursor_word_at(p))
+    }
+
+    /// Whether only whitespace, or nothing, lies between `pos` and the word at the cursor
+    pub fn joins_cursor_word_at(&self, pos: usize) -> bool {
+        self.0.get(pos).is_some_and(|f| {
+            f.contains(Constraint::CursorWord) || f.contains(Constraint::SpaceBeforeCursorWord)
+        })
     }
 
     pub fn space_before_digit_at(&self, pos: usize) -> bool {
@@ -319,12 +350,12 @@ impl PunctuationConstrainer {
             // prepunc: not immediately preceded by a letter, then scan forward (past
             // any further punctuation) for a letter/digit before hitting whitespace.
             if pos == 0 || !self.letter_chars.contains(&chars[pos - 1]) {
-                for k in pos + 1..n {
-                    if self.letter_or_digit_chars.contains(&chars[k]) {
+                for c in &chars[pos + 1..] {
+                    if self.letter_or_digit_chars.contains(c) {
                         constraints[pos].insert(Constraint::PrepuncOk);
                         break;
                     }
-                    if self.space_chars.contains(&chars[k]) {
+                    if self.space_chars.contains(c) {
                         break;
                     }
                 }
@@ -517,14 +548,94 @@ impl ComputerBrailleConstrainer {
         let n = input.chars().count();
         let mut constraints: Vec<Constraints> = vec![Constraints::empty(); n];
         for span in spans {
-            if span.class == "computer_braille" {
-                let end = span.range.end.min(n);
-                for pos in span.range.start..end {
-                    constraints[pos].insert(Constraint::UseComp6);
+            if span.class() == "computer_braille" {
+                let end = span.range().end.min(n);
+                for c in constraints.iter_mut().take(end).skip(span.range().start) {
+                    c.insert(Constraint::UseComp6);
                 }
             }
         }
         constraints
+    }
+}
+
+/// Switches contractions off everywhere with the `noContractions` mode.
+#[derive(Debug, Clone)]
+pub struct NoContractionsConstrainer;
+
+impl NoContractionsConstrainer {
+    fn compute(&self, input: &str, options: &TranslationOptions) -> Vec<Constraints> {
+        let constraints = if options.modes().contains(TranslationMode::NoContractions) {
+            Constraints::only(Constraint::Uncontracted)
+        } else {
+            Constraints::empty()
+        };
+        vec![constraints; input.chars().count()]
+    }
+}
+
+/// Finds the word at the cursor to show uncontracted, in computer braille, with
+/// `compbrlAtCursor` or `compbrlLeftCursor`, as liblouis does: the word the cursor is in, up
+/// to the next space, or only up to the cursor with `compbrlLeftCursor`; the space itself if
+/// the cursor is on one.
+///
+/// Unlike liblouis, `repeated` rules next to the word are left alone: liblouis's limits
+/// there are off by one, so a `repeated \s 0` expands spaces inconsistently (its own
+/// `present_progressive.yaml` marks this `xfail`), and a `repword` can't reach into the word.
+#[derive(Debug, Clone)]
+pub struct CursorWordConstrainer {
+    pub character_classes: CharacterClasses,
+}
+
+impl CursorWordConstrainer {
+    fn compute(&self, input: &str, options: &TranslationOptions) -> Vec<Constraints> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut constraints = vec![Constraints::empty(); chars.len()];
+        let Some(word) = self.word(&chars, options) else {
+            return constraints;
+        };
+        for c in &mut constraints[word.clone()] {
+            *c |= Constraint::UseComp6 | Constraint::CursorWord;
+        }
+        let is_space = |c: &char| self.character_classes.is_whitespace(*c);
+        let spaces = chars[..word.start]
+            .iter()
+            .rev()
+            .take_while(|c| is_space(c))
+            .count();
+        for c in &mut constraints[word.start - spaces..word.start] {
+            c.insert(Constraint::SpaceBeforeCursorWord);
+        }
+        constraints
+    }
+
+    fn word(&self, chars: &[char], options: &TranslationOptions) -> Option<Range<usize>> {
+        let modes = options.modes();
+        let left = modes.contains(TranslationMode::CompbrlLeftCursor);
+        if !(left || modes.contains(TranslationMode::CompbrlAtCursor)) {
+            return None;
+        }
+        let cursor = options.cursor_position()?;
+        if cursor > chars.len() {
+            return None;
+        }
+        let is_space = |c: &char| self.character_classes.is_whitespace(*c);
+        if chars.get(cursor).is_some_and(is_space) {
+            return Some(cursor..cursor + 1);
+        }
+        let start = chars[..cursor]
+            .iter()
+            .rposition(is_space)
+            .map_or(0, |p| p + 1);
+        let end = if left {
+            cursor
+        } else {
+            chars[cursor..]
+                .iter()
+                .position(is_space)
+                .map_or(chars.len(), |p| cursor + p)
+        };
+        Some(start..end)
     }
 }
 
@@ -820,10 +931,21 @@ pub enum Constrainer {
     /// Detects words that a `repword`/`rependword` separator repeats and sets
     /// [`Constraint::RepeatedWord`]/[`Constraint::RepeatedWordEnd`].
     Repword(RepwordConstrainer),
+    /// Sets [`Constraint::Uncontracted`] everywhere with the `noContractions` mode.
+    NoContractions(NoContractionsConstrainer),
+    /// Finds the word at the cursor with `compbrlAtCursor` or `compbrlLeftCursor` and sets
+    /// [`Constraint::UseComp6`] and [`Constraint::CursorWord`] in it, and
+    /// [`Constraint::SpaceBeforeCursorWord`] before it.
+    CursorWord(CursorWordConstrainer),
 }
 
 impl Constrainer {
-    fn compute(&self, input: &str, spans: &[EmphasisSpan]) -> Vec<Constraints> {
+    fn compute(
+        &self,
+        input: &str,
+        spans: &[EmphasisSpan],
+        options: &TranslationOptions,
+    ) -> Vec<Constraints> {
         match self {
             Constrainer::Numeric(c) => c.compute(input),
             Constrainer::ComputerBraille(c) => c.compute(input, spans),
@@ -836,6 +958,8 @@ impl Constrainer {
             Constrainer::NoCont(c) => c.compute(input),
             Constrainer::CapsNoCont(c) => c.compute(input),
             Constrainer::Repword(c) => c.compute(input),
+            Constrainer::NoContractions(c) => c.compute(input, options),
+            Constrainer::CursorWord(c) => c.compute(input, options),
         }
     }
 }
@@ -849,13 +973,18 @@ impl Constrainers {
         Constrainers(constrainers)
     }
 
-    pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PositionConstraints {
+    pub fn precompute(
+        &self,
+        input: &str,
+        spans: &[EmphasisSpan],
+        options: &TranslationOptions,
+    ) -> PositionConstraints {
         let n = input.chars().count();
         let mut constraints: Vec<Constraints> = vec![Constraints::empty(); n];
         for constrainer in &self.0 {
             for (accum, computed) in constraints
                 .iter_mut()
-                .zip(constrainer.compute(input, spans))
+                .zip(constrainer.compute(input, spans, options))
             {
                 *accum |= computed;
             }
@@ -1239,6 +1368,7 @@ impl RepwordConstrainerBuilder {
 mod tests {
     use super::*;
     use crate::emphasis::EmphasisSpan;
+    use crate::translator::TranslationModes;
 
     fn dont_contract(c: &PositionConstraints) -> Vec<bool> {
         c.0.iter()
@@ -1269,7 +1399,11 @@ mod tests {
     #[test]
     fn numeric_run() {
         // from the first digit to the next space, the letters after the number included
-        let c = numeric_constrainers(numeric_mode_builder()).precompute("ab12a a", &[]);
+        let c = numeric_constrainers(numeric_mode_builder()).precompute(
+            "ab12a a",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(
             dont_contract(&c),
             vec![false, false, true, true, true, false, false]
@@ -1299,7 +1433,7 @@ mod tests {
         let constrainers = Constrainers::new(vec![Constrainer::ComputerBraille(
             ComputerBrailleConstrainer {},
         )]);
-        let c = constrainers.precompute("hello", &spans);
+        let c = constrainers.precompute("hello", &spans, &TranslationOptions::default());
         assert_eq!(use_comp6(&c), vec![false, true, true, true, false]);
         assert_eq!(dont_contract(&c), vec![false, false, false, false, false]);
     }
@@ -1333,7 +1467,11 @@ mod tests {
         let mut builder = BackwardNoContractConstrainerBuilder::new();
         builder.indicator("L");
         builder.letter_cells(HashSet::from(['a', 'b', 'c']));
-        let c = backward_nocontract_constrainers(builder).precompute("Lab cLc", &[]);
+        let c = backward_nocontract_constrainers(builder).precompute(
+            "Lab cLc",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(
             no_contract(&c),
             vec![false, true, true, false, false, false, true]
@@ -1354,7 +1492,11 @@ mod tests {
         builder.indicator("L");
         builder.letter_cells(HashSet::from(['a', 'b']));
         builder.space_cells(HashSet::from([' ']));
-        let c = backward_nocontract_constrainers(builder).precompute("La.b b", &[]);
+        let c = backward_nocontract_constrainers(builder).precompute(
+            "La.b b",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(
             no_contract(&c),
             vec![false, true, false, false, false, false]
@@ -1373,7 +1515,11 @@ mod tests {
         builder.rule_dots("Lb");
         builder.letter_cells(HashSet::from(['a', 'b']));
         builder.space_cells(HashSet::from([' ']));
-        let c = backward_nocontract_constrainers(builder).precompute("Lb-b La-b", &[]);
+        let c = backward_nocontract_constrainers(builder).precompute(
+            "Lb-b La-b",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(
             no_contract(&c),
             vec![false, false, false, false, false, false, true, false, false]
@@ -1392,7 +1538,11 @@ mod tests {
         builder.inword_rule_dots("Lb");
         builder.letter_cells(HashSet::from(['a', 'b']));
         builder.space_cells(HashSet::from([' ']));
-        let c = backward_nocontract_constrainers(builder).precompute("aLb-a Lb", &[]);
+        let c = backward_nocontract_constrainers(builder).precompute(
+            "aLb-a Lb",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(
             no_contract(&c),
             vec![false, false, false, false, false, false, false, true]
@@ -1409,7 +1559,11 @@ mod tests {
         builder.caps_indicator("C");
         builder.caps_indicator("CC");
         builder.letter_cells(HashSet::from(['a', 'b']));
-        let c = backward_nocontract_constrainers(builder).precompute("LCCCa b", &[]);
+        let c = backward_nocontract_constrainers(builder).precompute(
+            "LCCCa b",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(
             no_contract(&c),
             vec![false, false, false, false, true, false, false]
@@ -1424,7 +1578,11 @@ mod tests {
         builder.indicator("N");
         builder.indicator("NN");
         builder.letter_cells(HashSet::from(['a', 'N']));
-        let c = backward_nocontract_constrainers(builder).precompute("NNa", &[]);
+        let c = backward_nocontract_constrainers(builder).precompute(
+            "NNa",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(no_contract(&c), vec![false, false, true]);
     }
 
@@ -1434,7 +1592,7 @@ mod tests {
         builder.syllable("hood");
         builder.syllable("ho");
         let c = Constrainers::new(vec![Constrainer::Syllable(builder.build().unwrap())])
-            .precompute("tHoodho", &[]);
+            .precompute("tHoodho", &[], &TranslationOptions::default());
         let marked: Vec<bool> =
             c.0.iter()
                 .map(|f| f.contains(Constraint::SyllableStart))
@@ -1448,8 +1606,11 @@ mod tests {
         let mut builder = NoContConstrainerBuilder::new();
         builder.nocont("c@");
         builder.space_characters(HashSet::from([' ']));
-        let c = Constrainers::new(vec![Constrainer::NoCont(builder.build().unwrap())])
-            .precompute("ab C@D e", &[]);
+        let c = Constrainers::new(vec![Constrainer::NoCont(builder.build().unwrap())]).precompute(
+            "ab C@D e",
+            &[],
+            &TranslationOptions::default(),
+        );
         let marked: Vec<bool> =
             c.0.iter()
                 .map(|f| f.contains(Constraint::Uncontracted))
@@ -1467,7 +1628,7 @@ mod tests {
         builder.uppercase_characters(HashSet::from(['A', 'B']));
         builder.space_characters(HashSet::from([' ']));
         let c = Constrainers::new(vec![Constrainer::CapsNoCont(builder.build().unwrap())])
-            .precompute("aABa Aa", &[]);
+            .precompute("aABa Aa", &[], &TranslationOptions::default());
         let marked: Vec<bool> =
             c.0.iter()
                 .map(|f| f.contains(Constraint::Uncontracted))
@@ -1482,8 +1643,11 @@ mod tests {
         let mut builder = RepwordConstrainerBuilder::new();
         builder.separator('-');
         builder.letter_characters("abcxABC".chars().collect());
-        let c = Constrainers::new(vec![Constrainer::Repword(builder.build().unwrap())])
-            .precompute(input, &[]);
+        let c = Constrainers::new(vec![Constrainer::Repword(builder.build().unwrap())]).precompute(
+            input,
+            &[],
+            &TranslationOptions::default(),
+        );
         let at = input.chars().position(|c| c == '-').unwrap();
         (
             c.run_before(at, Constraint::RepeatedWord),
@@ -1496,8 +1660,11 @@ mod tests {
         let mut builder = RepwordConstrainerBuilder::new();
         builder.separator('-');
         builder.letter_characters("abcx".chars().collect());
-        let c = Constrainers::new(vec![Constrainer::Repword(builder.build().unwrap())])
-            .precompute("abc-abc-abc-abx", &[]);
+        let c = Constrainers::new(vec![Constrainer::Repword(builder.build().unwrap())]).precompute(
+            "abc-abc-abc-abx",
+            &[],
+            &TranslationOptions::default(),
+        );
         // the second `-abc`, but not `-abx`
         let marked: Vec<usize> = (0..15).filter(|&p| c.repetition_at(p)).collect();
         assert_eq!(marked, (7..11).collect::<Vec<_>>());
@@ -1517,8 +1684,11 @@ mod tests {
         builder.mark_present();
         builder.letter_characters(HashSet::from(['a']));
         builder.space_characters(HashSet::from([' ']));
-        let c = Constrainers::new(vec![Constrainer::Join(builder.build().unwrap())])
-            .precompute("a  a . a", &[]);
+        let c = Constrainers::new(vec![Constrainer::Join(builder.build().unwrap())]).precompute(
+            "a  a . a",
+            &[],
+            &TranslationOptions::default(),
+        );
         let marked: Vec<usize> = (0..8).filter(|&p| c.space_before_letter_at(p)).collect();
         // not the space before the `.`
         assert_eq!(marked, vec![1, 2, 6]);
@@ -1530,8 +1700,11 @@ mod tests {
         builder.mark_present();
         builder.digit_characters(HashSet::from(['1']));
         builder.space_characters(HashSet::from([' ']));
-        let c = Constrainers::new(vec![Constrainer::Join(builder.build().unwrap())])
-            .precompute("$  1 a $ 1", &[]);
+        let c = Constrainers::new(vec![Constrainer::Join(builder.build().unwrap())]).precompute(
+            "$  1 a $ 1",
+            &[],
+            &TranslationOptions::default(),
+        );
         let marked: Vec<bool> =
             c.0.iter()
                 .map(|f| f.contains(Constraint::SpaceBeforeDigit))
@@ -1549,7 +1722,11 @@ mod tests {
         let mut builder = BackwardNumericConstrainerBuilder::new();
         builder.numsign("N");
         builder.digit_cells(HashSet::from(['1', '2']));
-        let c = backward_numeric_constrainers(builder).precompute("N12a1", &[]);
+        let c = backward_numeric_constrainers(builder).precompute(
+            "N12a1",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(prefer_digit(&c), vec![false, true, true, false, false]);
     }
 
@@ -1559,7 +1736,11 @@ mod tests {
         builder.numsign("N");
         builder.nonumsign("X");
         builder.digit_cells(HashSet::from(['1', '2']));
-        let c = backward_numeric_constrainers(builder).precompute("N1X2", &[]);
+        let c = backward_numeric_constrainers(builder).precompute(
+            "N1X2",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(prefer_digit(&c), vec![false, true, false, false]);
     }
 
@@ -1575,10 +1756,10 @@ mod tests {
         builder.letter_cells(HashSet::from(['x', 'N']));
         builder.after_letter("N");
         let constrainers = backward_numeric_constrainers(builder);
-        let c = constrainers.precompute("xN12", &[]);
+        let c = constrainers.precompute("xN12", &[], &TranslationOptions::default());
         assert_eq!(prefer_digit(&c), vec![false, false, false, false]);
         // at the start of a word the numsign still starts a number
-        let c = constrainers.precompute(" N12", &[]);
+        let c = constrainers.precompute(" N12", &[], &TranslationOptions::default());
         assert_eq!(prefer_digit(&c), vec![false, false, true, true]);
     }
 
@@ -1590,7 +1771,11 @@ mod tests {
         builder.digit_cells(HashSet::from(['1', '2']));
         builder.letter_cells(HashSet::from(['x']));
         builder.rule_dots("xN");
-        let c = backward_numeric_constrainers(builder).precompute("xN12", &[]);
+        let c = backward_numeric_constrainers(builder).precompute(
+            "xN12",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(prefer_digit(&c), vec![false, false, false, false]);
     }
 
@@ -1602,7 +1787,42 @@ mod tests {
         builder.numsign("N");
         builder.digit_cells(HashSet::from(['1', '2']));
         builder.letter_cells(HashSet::from(['x']));
-        let c = backward_numeric_constrainers(builder).precompute("xN12", &[]);
+        let c = backward_numeric_constrainers(builder).precompute(
+            "xN12",
+            &[],
+            &TranslationOptions::default(),
+        );
         assert_eq!(prefer_digit(&c), vec![false, false, true, true]);
+    }
+
+    #[test]
+    fn cursor_word() {
+        let mut classes = CharacterClasses::default();
+        classes.insert(crate::parser::CharacterClass::Space, ' ');
+        let constrainers =
+            Constrainers::new(vec![Constrainer::CursorWord(CursorWordConstrainer {
+                character_classes: classes,
+            })]);
+        let options = TranslationOptions::default()
+            .with_modes([TranslationMode::CompbrlAtCursor].into_iter().collect())
+            .with_cursor_position(5);
+        let c = constrainers.precompute("ab  cde f", &[], &options);
+        let flags = |pos| c.0[pos];
+        assert!(flags(4).is_superset(Constraint::CursorWord | Constraint::UseComp6));
+        assert!(flags(6).contains(Constraint::CursorWord));
+        assert!(!flags(7).contains(Constraint::CursorWord));
+        assert!(flags(2).contains(Constraint::SpaceBeforeCursorWord));
+        assert!(flags(3).contains(Constraint::SpaceBeforeCursorWord));
+        assert!(c.reaches_into_cursor_word(1, 4));
+        assert!(!c.reaches_into_cursor_word(1, 3));
+        assert!(c.joins_cursor_word_at(2));
+        assert!(!c.joins_cursor_word_at(1));
+        // without the mode, there is no word at the cursor
+        let c = constrainers.precompute(
+            "ab  cde f",
+            &[],
+            &options.with_modes(TranslationModes::empty()),
+        );
+        assert!(!(0..9).any(|pos| c.in_cursor_word_at(pos)));
     }
 }

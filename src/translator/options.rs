@@ -6,7 +6,7 @@
 
 use enumset::{EnumSet, EnumSetType};
 
-use crate::emphasis::EmphasisSpan;
+use crate::emphasis::Emphasis;
 
 /// Flags that modify the behaviour of the translator.
 ///
@@ -17,22 +17,20 @@ use crate::emphasis::EmphasisSpan;
 #[enumset(no_ops)]
 #[non_exhaustive]
 pub enum TranslationMode {
-    /// Translate without contractions (liblouis's `noContractions`). Not implemented yet:
-    /// ignored.
+    /// Translate without contractions (liblouis's `noContractions`): no `word`, `always`,
+    /// `match` or other contracting rule applies. Backward: ignored.
     NoContractions,
-    /// Translate the word at the cursor in computer braille. Not implemented yet: ignored.
+    /// Show the word at the cursor uncontracted, in computer braille without `begcomp` and
+    /// `endcomp` (`compbrlAtCursor`). Needs a cursor position; backward: ignored.
     CompbrlAtCursor,
-    /// Read and write braille as dot patterns rather than characters (`dotsIO`). Not
-    /// implemented yet: ignored.
-    DotsIo,
-    /// Translate from the cursor to the end of the word in computer braille. Not
-    /// implemented yet: ignored.
+    /// Like [`CompbrlAtCursor`](Self::CompbrlAtCursor), but only the part of the word
+    /// before the cursor (`compbrlLeftCursor`).
     CompbrlLeftCursor,
-    /// Write computer braille with uppercase letters (`ucBrl`). Not implemented yet: ignored.
-    UcBrl,
     /// Drop characters the tables don't define rather than writing them out (`noUndefined`)
     NoUndefined,
-    /// Translate a partial input (`partialTrans`). Not implemented yet: ignored.
+    /// Back-translate input that may end in the middle of a word, such as braille typed so
+    /// far (`partialTrans`): no word is taken to end, so rules for whole words or word
+    /// ends don't apply, and rules for a word that goes on do. Forward: ignored.
     PartialTrans,
 }
 
@@ -66,47 +64,47 @@ impl FromIterator<TranslationMode> for TranslationModes {
 /// Per-call options for a translation.
 ///
 /// Positions are indices of characters (Unicode scalar values), not of bytes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TranslationOptions {
-    mode: TranslationModes,
-    /// Per-character emphasis annotations (which emphasis classes are active where).
-    emphasis: Vec<EmphasisSpan>,
-    cursor_pos: Option<usize>,
+    modes: TranslationModes,
+    /// Which emphasis classes are active where in the input
+    emphasis: Emphasis,
+    cursor_position: Option<usize>,
 }
 
 impl TranslationOptions {
-    /// Translate with `mode`.
-    pub fn with_mode(mut self, mode: TranslationModes) -> Self {
-        self.mode = mode;
+    /// Translate with `modes`.
+    pub fn with_modes(mut self, modes: TranslationModes) -> Self {
+        self.modes = modes;
         self
     }
 
     /// Translate with the input emphasized as `emphasis` says.
-    pub fn with_emphasis(mut self, emphasis: Vec<EmphasisSpan>) -> Self {
+    pub fn with_emphasis(mut self, emphasis: Emphasis) -> Self {
         self.emphasis = emphasis;
         self
     }
 
-    /// Map the cursor at input position `cursor_pos` to the output, in
-    /// [`TranslationResult::cursor_pos`](crate::TranslationResult::cursor_pos).
-    pub fn with_cursor_pos(mut self, cursor_pos: usize) -> Self {
-        self.cursor_pos = Some(cursor_pos);
+    /// Map the cursor at input position `cursor_position` to the output, in
+    /// [`TranslationResult::cursor_position`](crate::TranslationResult::cursor_position).
+    pub fn with_cursor_position(mut self, cursor_position: usize) -> Self {
+        self.cursor_position = Some(cursor_position);
         self
     }
 
     /// The modes to translate with.
-    pub fn mode(&self) -> &TranslationModes {
-        &self.mode
+    pub fn modes(&self) -> &TranslationModes {
+        &self.modes
     }
 
     /// The emphasis of the input.
-    pub fn emphasis(&self) -> &[EmphasisSpan] {
+    pub fn emphasis(&self) -> &Emphasis {
         &self.emphasis
     }
 
     /// The cursor position in the input, if there is one.
-    pub fn cursor_pos(&self) -> Option<usize> {
-        self.cursor_pos
+    pub fn cursor_position(&self) -> Option<usize> {
+        self.cursor_position
     }
 }
 

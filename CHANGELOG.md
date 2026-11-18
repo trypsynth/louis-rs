@@ -8,13 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased] - ReleaseDate
 
+## [0.4.0] - 2026-11-18
+
 ### Added
 - `louis::metadata` finds tables by their `#+key: value` metadata, like
   liblouis's `lou_findTables`: `Index::new()` indexes the tables on
   `LOUIS_TABLE_PATH`, `Index::with_search_path` those in the given
-  directories, and `Index::find` returns the tables matching a `Query`,
+  directories, and `Index::find` returns the tables matching a `&Query`,
   best match first. For now only tables carrying every pair of the query
-  match.
+  match. A `Query` is parsed with `"language:de grade:2".parse()`, or
+  collected from `(key, value)` pairs.
+- Back-translation returns the emphasis the braille indicates, as
+  `TranslationResult::emphasis()`: liblouis's typeform output. Unlike
+  liblouis, the space that ends an emphasized word is not emphasized.
+- `Emphasis`, a text's emphasis spans in one order, with touching spans
+  merged, so that two compare equal when they emphasize the same.
+  `TranslationOptions::with_emphasis` takes one instead of a
+  `Vec<EmphasisSpan>`, and `TranslationResult::emphasis()` returns one.
+- `BrailleEncoding` and `Translator::with_braille_encoding`: braille can
+  be read and written as other characters than Unicode braille, such as
+  ASCII braille. An encoding is loaded from a liblouis display table,
+  like a translation table (`new`, `with_search_path`,
+  `from_table_source`), e.g. `en-us-brf.dis`.
+- `louis translate` and `louis trace` call their `--display` option
+  `--braille-encoding`; `--display` still works.
+- `Translator::emphasis_classes` lists the emphasis classes the tables
+  declare, the names an `EmphasisSpan` can use, like liblouis's
+  `lou_getEmphClasses`.
+- The `partialTrans` mode: back-translating braille that may end in the
+  middle of a word, such as the cells typed so far, no word is taken to
+  end, so rules for whole words or word ends don't apply, as in
+  liblouis (#19).
+- The `compbrlAtCursor` and `compbrlLeftCursor` modes: with a cursor
+  position, the word at the cursor, or its part before the cursor, is
+  shown uncontracted in computer braille, without `begcomp` and
+  `endcomp`, as in liblouis (#20).
+- The `noContractions` mode: no contracting rule applies, as in
+  liblouis. Like liblouis, back-translation ignores it.
 
 ### Changed
 - louis-rs is in beta: translation matches liblouis closely, and the
@@ -22,19 +52,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The library API, on the way to a stable one:
   - `Translator`'s constructors return `louis::Error`, either
     `Error::Table` with the `TableError`s (now public) or `Error::Compile`
-    with a `CompileError` (formerly `TranslationError`). A syntax error in
+    with a `CompileError` (formerly `TranslationError`), which says
+    where the rule is (`path()`, `line()`) and what is wrong with it
+    (`kind()`, a `CompileErrorKind`). A syntax error in
     a table carries a `SyntaxError`, which says what is wrong without
     exposing the parser's internals.
   - `translate` returns a `String` and `translate_with_options` a
     `TranslationResult`, not a `Result`: translating cannot fail.
-  - `TranslationResult`'s `output_positions` and `input_positions` are
-    plain `Vec`s; they were always `Some`.
-  - The public enums and `TranslationResult` are `#[non_exhaustive]`.
+    `translate_with_options` borrows its `TranslationOptions`.
+  - `TranslationResult`'s fields are private, read with `output()`,
+    `emphasis()`, `output_positions()`, `input_positions()` and
+    `cursor_position()`. The positions are plain slices; they were always
+    `Some`. Likewise `EmphasisSpan`'s, read with `class()` and `range()`.
+  - The public enums are `#[non_exhaustive]`.
+  - `TranslationOptions::with_mode` and `mode()` are `with_modes` and
+    `modes()`, as they take a set of modes; `with_cursor_pos` and
+    `cursor_pos()` are `with_cursor_position` and `cursor_position()`,
+    like the positions.
+  - `Translator::with_search_path` takes any list of paths, such as
+    `["/usr/share/liblouis/tables"]`, not only a `Vec<PathBuf>`.
+  - `TranslationResult` implements `Clone`, `PartialEq` and `Eq`, and so
+    does `TranslationOptions` for the latter two.
+  - Error messages start in lowercase and end without a full stop.
+    `Error::Table` shows the first error and how many more there are,
+    instead of only "errors when reading the braille table(s)", and a
+    syntax error names its table.
   - `TranslationModes` implements `PartialEq`, `Eq`, `Copy` and
     `FromIterator`.
   - `TranslationMode` and `Direction` lose the `|` that returned an
     `enumset::EnumSet`. Build a set of modes with
     `TranslationModes::insert` or `collect`.
+  - `TranslationMode::DotsIo` and `UcBrl` are gone. In liblouis they
+    choose the output encoding; louis-rs writes Unicode braille, which is
+    what `dotsIO | ucBrl` gives, unless given a `BrailleEncoding`.
+- In a multipass, `correct` or `context` test, `_N` is accepted only
+  before the tests that consume characters, as a look-behind, or after
+  them at the end, as a look-ahead, and must step over tests of fixed
+  width. Any other `_N` is a syntax error. In liblouis's tables this
+  affects three rules, in `it-it-comp6.utb` and `th-g2.ctb`, which load
+  again with liblouis#2196 and #2197.
 - The `backwards_compatibility` feature is gone. louis-rs always behaves
   as it did with it, like liblouis: the first definition of a character
   wins.
@@ -53,8 +109,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   in both directions and reports its errors, like liblouis's
   `lou_checktable`. It prints "No errors found." unless given `--quiet`.
   The rule dump and the rule-parsing REPL are gone.
+- Translation is faster, several times so for tables with many `match`,
+  `context`, `correct` or `pass2`-`pass4` rules: at each position only the
+  rules that can start with the character there are tried, not all of
+  them.
 
 ### Fixed
+- Two large signs that only spaces separate are written without the
+  space between them, as in liblouis: `en-us-g2.ctb`'s "of the" is ⠷⠮,
+  not ⠷⠀⠮.
+- With a table that has `compbrl` rules, translating no longer takes time
+  growing with the square of the input's length: the scan for their
+  triggers copied the rest of the input at every character, and
+  compared every word it found with all the words before it.
+- Back-translation no longer looks for `compbrl` triggers, which are
+  print text and never match braille cells; liblouis uses them forward
+  only too. The scan took most of the time of back-translating a long
+  input.
+- A character defined after a `base` rule for it is translated with its
+  own dots, and the `base` rule only adds its class, as in liblouis: a
+  capital of `nl-NL-g0.utb` keeps its virtual dot, and `vi-cb8.utb`'s
+  capitals and Swedish Į and Ų come out as in liblouis.
+- `match` rules don't contract in a word with a `nocont` string, or
+  after capitals with `capsnocont`, as in liblouis.
+- A trailing `_N` leaves the characters it steps back over for the next
+  rule. In a rule without brackets or with a `*` action they were
+  consumed and lost, as in `th-g2.ctb`'s `"ใคร"!%ToneAndVowels_`.
+- A leading `_N` is a look-behind, checked backwards from the cursor. A
+  rule with a `*` action no longer consumes it, and the rule is no
+  longer lost when another rule consumes the look-behind together with
+  the text before it, as `always ar` does in "around" with
+  `context _$l["ound"]`.
+- A swap class in a multipass action drops the characters it doesn't
+  cover, as liblouis does, instead of keeping them.
 - Multipass and `context` variables work as in liblouis: `#1+` and `#1-`
   increment and decrement, a test can compare with `<`, `>`, `<=` and
   `>=` as well as `=`, and a variable that was never set is 0. Before,
@@ -658,7 +745,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 -   Make it clear that the library API is unstable.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/liblouis/louis-rs/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/liblouis/louis-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/liblouis/louis-rs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/liblouis/louis-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/liblouis/louis-rs/compare/v0.2.8...v0.3.0
 [0.2.8]: https://github.com/liblouis/louis-rs/compare/v0.2.7...v0.2.8

@@ -18,9 +18,10 @@ Use the Linux kernel's coding-assistants trailer format (https://docs.kernel.org
   to fail were table-authoring bugs, not louis-rs gaps, and have since been fixed
   upstream (liblouis/liblouis#2070, #2071, #2072); the last one was ours, an
   escaped `"\\"` multipass operand in `it-it-comp6.utb:248`, fixed in 4980ced
-- Figures above measured at louis-rs `a7b8e47` against liblouis `011cfb3b` plus
-  liblouis#2176 and #2190; see
-  `doc/Liblouis_Parity.md`, which is the one place to update them
+- `it-it-comp6.utb` and `th-g2.ctb` load only with liblouis#2196 and #2197, which
+  remove a `_N` in the middle of a test
+- Figures above: `doc/Liblouis_Parity.md` says at which commits and against which
+  liblouis pull requests they were measured, and is the one place to update them
 - Library API: follows semver, breaking changes only in a new 0.x minor version;
   `louis::internals` is not covered
 
@@ -136,8 +137,6 @@ library's.
 Tests use YAML files from the liblouis project. Current gaps:
 - Emphasis indication (partial support)
 - Some backward translation rules
-- Computer braille cursor modes (`compbrlAtCursor`/`compbrlLeftCursor` not implemented)
-- Typeform output (`TranslationResult::emphasis` is never populated)
 
 See `TODO.org` for detailed tracking.
 
@@ -153,7 +152,7 @@ See `TODO.org` for detailed tracking.
 - Emphasis indication not fully implemented
 - nocross-driven hyphenation dictionary lookup works natively (`src/hyphenation.rs`)
 - Some backward translation modes missing
-- Computer braille is implemented as a full pipeline feature; only `compbrlAtCursor`/`compbrlLeftCursor` modes are missing
+- Computer braille is implemented as a full pipeline feature, including the cursor modes `compbrlAtCursor`/`compbrlLeftCursor`
 
 ## Relevant Files for Common Tasks
 

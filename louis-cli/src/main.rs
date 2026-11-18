@@ -77,10 +77,11 @@ enum Commands {
         /// Direction of translation
         #[arg(value_enum, short, long, default_value_t=DirectionArg::Forward)]
         direction: DirectionArg,
-        /// Display table mapping braille cells to the characters they are shown as. Without
-        /// it braille is read and written as Unicode braille (U+2800).
-        #[arg(long)]
-        display: Option<PathBuf>,
+        /// Braille encoding: a liblouis display table (`.dis`) saying which characters stand
+        /// for the braille cells, e.g. en-us-brf.dis for ASCII braille. Without it braille is
+        /// read and written as Unicode braille (U+2800).
+        #[arg(long, visible_alias = "display")]
+        braille_encoding: Option<PathBuf>,
     },
     /// List all the rules that were applied for the translation of `input` using the specified
     /// braille `table`.
@@ -98,10 +99,11 @@ enum Commands {
         direction: DirectionArg,
         #[arg(value_enum, short, long, default_value_t=TraceStyle::Table)]
         style: TraceStyle,
-        /// Display table mapping braille cells to the characters they are shown as. Without
-        /// it braille is read and written as Unicode braille (U+2800).
-        #[arg(long)]
-        display: Option<PathBuf>,
+        /// Braille encoding: a liblouis display table (`.dis`) saying which characters stand
+        /// for the braille cells, e.g. en-us-brf.dis for ASCII braille. Without it braille is
+        /// read and written as Unicode braille (U+2800).
+        #[arg(long, visible_alias = "display")]
+        braille_encoding: Option<PathBuf>,
     },
     /// Test braille translations from given YAML file(s).
     Check {
@@ -134,7 +136,7 @@ struct Cli {
 fn print_errors(errors: Vec<TableError>) {
     for error in errors {
         match error {
-            TableError::ParseError { path, line, error } => match path {
+            TableError::Syntax { path, line, error } => match path {
                 Some(path) => eprintln!("{}:{}: {}", path.display(), line, error),
                 None => eprintln!("{}: {}", line, error),
             },
@@ -182,23 +184,19 @@ struct Trace {
     sequence_id: usize,
     from: String,
     to: String,
-    #[tabled(display_with("Self::display_origin", self))]
+    #[tabled(display = "display_rule")]
     rule: Option<AnchoredRule>,
     stage: TranslationStage,
 }
 
-impl Trace {
-    fn display_origin(&self) -> String {
-        match &self.rule {
-            Some(AnchoredRule { rule, .. }) => {
-                format!("{}", rule)
-            }
-            None => String::new(),
-        }
+fn display_rule(rule: &Option<AnchoredRule>) -> String {
+    match rule {
+        Some(AnchoredRule { rule, .. }) => format!("{}", rule),
+        None => String::new(),
     }
 }
 
-fn print_trace(all_translations: &Vec<Vec<ResolvedTranslation>>, style: &TraceStyle) {
+fn print_trace(all_translations: &[Vec<ResolvedTranslation>], style: &TraceStyle) {
     let mut traces: Vec<Trace> = Vec::new();
     for (id, translation) in all_translations
         .iter()
@@ -313,18 +311,15 @@ struct YAMLTestResult {
     #[tabled(rename = "YAML File")]
     yaml_file: String,
     tests: usize,
-    #[tabled(display_with("Self::display_successes", self))]
+    #[tabled(display("Self::display_percent", self))]
     successes: usize,
-    #[tabled(display_with("Self::display_failures", self))]
+    #[tabled(display("Self::display_percent", self))]
     failures: usize,
-    #[tabled(
-        rename = "Expected\nFailures",
-        display_with("Self::display_expected", self)
-    )]
+    #[tabled(rename = "Expected\nFailures", display("Self::display_percent", self))]
     expected_failures: usize,
     #[tabled(
         rename = "Unexpected\nSuccesses",
-        display_with("Self::display_unexpected", self)
+        display("Self::display_percent", self)
     )]
     unexpected_successes: usize,
     #[tabled(rename = "Position\nMismatches")]
@@ -336,17 +331,9 @@ fn percent(n: usize, total: usize) -> f64 {
 }
 
 impl YAMLTestResult {
-    fn display_successes(&self) -> String {
-        format!("{:.1}%", percent(self.successes, self.tests))
-    }
-    fn display_failures(&self) -> String {
-        format!("{:.1}%", percent(self.failures, self.tests))
-    }
-    fn display_expected(&self) -> String {
-        format!("{:.1}%", percent(self.expected_failures, self.tests))
-    }
-    fn display_unexpected(&self) -> String {
-        format!("{:.1}%", percent(self.unexpected_successes, self.tests))
+    /// A count as a percentage of the tests
+    fn display_percent(n: &usize, result: &Self) -> String {
+        format!("{:.1}%", percent(*n, result.tests))
     }
     fn update(
         &mut self,
@@ -472,12 +459,12 @@ fn check_yaml(paths: Vec<PathBuf>, summary: bool) -> ExitCode {
     }
 }
 
-static INDEX: LazyLock<Result<metadata::Index, metadata::MetaDataError>> =
+static INDEX: LazyLock<Result<metadata::Index, metadata::MetadataError>> =
     LazyLock::new(metadata::Index::new);
 
 /// The index of the tables on `LOUIS_TABLE_PATH`, built once on first use: the YAML files
 /// run in parallel and many query their tables, so they share one walk of the search path.
-fn index() -> Result<&'static metadata::Index, &'static metadata::MetaDataError> {
+fn index() -> Result<&'static metadata::Index, &'static metadata::MetadataError> {
     INDEX.as_ref()
 }
 
@@ -492,7 +479,7 @@ fn main() -> ExitCode {
             table,
             input,
             direction,
-            display,
+            braille_encoding: display,
         } => match input {
             Some(input) => translate(&table, display.as_deref(), direction.into(), &input),
             None => match pipeline(&table, display.as_deref(), direction.into()) {
@@ -510,7 +497,7 @@ fn main() -> ExitCode {
             input,
             direction,
             style,
-            display,
+            braille_encoding: display,
         } => match input {
             Some(input) => trace(&table, display.as_deref(), direction.into(), &input, &style),
             None => match pipeline(&table, display.as_deref(), direction.into()) {
@@ -528,9 +515,9 @@ fn main() -> ExitCode {
             yaml_files,
             summary,
         } => check_yaml(yaml_files, summary),
-        Commands::Query { query } => match (metadata::Query::parse(&query.join(" ")), index()) {
+        Commands::Query { query } => match (query.join(" ").parse::<metadata::Query>(), index()) {
             (Ok(query), Ok(index)) => {
-                println!("{:?}", index.find(query));
+                println!("{:?}", index.find(&query));
                 ExitCode::SUCCESS
             }
             (Err(e), _) => {
